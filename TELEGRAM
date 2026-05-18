@@ -1,0 +1,387 @@
+import asyncio
+import secrets
+import hashlib
+import hmac
+import html
+import time
+import datetime
+from collections import defaultdict
+from cryptography.fernet import Fernet
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, BigInteger, Boolean, String, DateTime, Integer, select, delete
+from aiohttp import web
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO)
+
+# ============================================
+# ТОКЕН ВСТАВЛЕН ПРЯМО В КОД (НЕБЕЗОПАСНО!)
+# ============================================
+BOT_TOKEN = "8849006101:AAGiGFndIA6VePgsPdYHKewqVshdadbH3Rk"
+
+# Переменные окружения для остальных настроек
+DATABASE_URL = os.getenv("DATABASE_URL")
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32)).encode()
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", Fernet.generate_key())
+
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL не задан (добавьте PostgreSQL в Render)")
+
+fernet = Fernet(ENCRYPTION_KEY)
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+Base = declarative_base()
+
+# ---------- Шифрование ----------
+def encrypt_id(user_id: int) -> str:
+    return fernet.encrypt(str(user_id).encode()).decode()
+
+def decrypt_id(encrypted: str) -> int:
+    return int(fernet.decrypt(encrypted.encode()).decode())
+
+# ---------- Модели ----------
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True)
+    encrypted_partner = Column(String(255), nullable=True)
+    is_premium = Column(Boolean, default=False)
+    premium_until = Column(DateTime, nullable=True)
+    search_gender = Column(String(10), nullable=True)
+    search_age_max = Column(Integer, nullable=True)
+    room = Column(String(50), default="default")
+    banned_until = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    @property
+    def current_partner(self):
+        if self.encrypted_partner:
+            return decrypt_id(self.encrypted_partner)
+        return None
+
+    @current_partner.setter
+    def current_partner(self, value):
+        if value is None:
+            self.encrypted_partner = None
+        else:
+            self.encrypted_partner = encrypt_id(value)
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    id = Column(Integer, primary_key=True)
+    encrypted_user1 = Column(String(255), nullable=False)
+    encrypted_user2 = Column(String(255), nullable=False)
+    started_at = Column(DateTime, default=datetime.datetime.utcnow)
+    ended_at = Column(DateTime, nullable=True)
+    session_token = Column(String(64), unique=True, nullable=False)
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+def hash_user_id(user_id: int) -> str:
+    return hashlib.blake2b(f"{user_id}{SECRET_KEY}".encode(), digest_size=8).hexdigest()
+
+def sign_data(data: str) -> str:
+    signature = hmac.new(SECRET_KEY, data.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{data}:{signature}"
+
+def verify_signed_data(signed: str) -> str | None:
+    try:
+        data, signature = signed.rsplit(":", 1)
+        expected = hmac.new(SECRET_KEY, data.encode(), hashlib.sha256).hexdigest()[:16]
+        if hmac.compare_digest(signature, expected):
+            return data
+    except:
+        return None
+    return None
+
+def generate_session_token() -> str:
+    return secrets.token_urlsafe(32)
+
+rate_cache = defaultdict(list)
+
+class RateLimitMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: types.TelegramObject, data: dict):
+        user_id = None
+        if isinstance(event, (types.Message, types.CallbackQuery)):
+            user_id = event.from_user.id
+        if user_id:
+            now = time.time()
+            rate_cache[user_id] = [t for t in rate_cache[user_id] if now - t < 1]
+            if len(rate_cache[user_id]) >= 5:
+                if isinstance(event, types.Message):
+                    await event.answer("⏳ Слишком много запросов. Подождите.")
+                elif isinstance(event, types.CallbackQuery):
+                    await event.answer("⏳ Слишком много запросов.", show_alert=False)
+                return
+            rate_cache[user_id].append(now)
+        return await handler(event, data)
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Поиск"), KeyboardButton(text="💬 Комнаты")],
+            [KeyboardButton(text="🎥 Позвонить"), KeyboardButton(text="⭐ Премиум"), KeyboardButton(text="🚪 Выйти")],
+            [KeyboardButton(text="🗑️ Удалить мои данные")]
+        ],
+        resize_keyboard=True
+    )
+
+def safe_inline_button(text: str, callback_data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=sign_data(callback_data))
+
+def search_settings_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [safe_inline_button("👩 Девушки", "search_gender_female"),
+         safe_inline_button("👨 Парни", "search_gender_male"),
+         safe_inline_button("🔄 Любые", "search_gender_any")],
+        [safe_inline_button("📅 До 25", "search_age_under25"),
+         safe_inline_button("📅 25-35", "search_age_25_35"),
+         safe_inline_button("📅 Любой", "search_age_any")],
+        [safe_inline_button("✅ Применить", "search_apply")]
+    ])
+
+async def get_or_create_user(user_id: int, db: AsyncSession):
+    user = await db.execute(select(User).where(User.id == user_id))
+    user = user.scalar_one_or_none()
+    if not user:
+        user = User(id=user_id)
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+    return user
+
+async def clear_user_data(user_id: int, db: AsyncSession):
+    waiting_users.pop(user_id, None)
+    user = await db.execute(select(User).where(User.id == user_id))
+    user = user.scalar_one_or_none()
+    if user and user.current_partner:
+        partner_id = user.current_partner
+        partner = await db.execute(select(User).where(User.id == partner_id))
+        partner = partner.scalar_one_or_none()
+        if partner:
+            partner.current_partner = None
+        session = await db.execute(select(ChatSession).where(
+            ((ChatSession.encrypted_user1 == encrypt_id(user_id)) | (ChatSession.encrypted_user2 == encrypt_id(user_id))) &
+            (ChatSession.ended_at.is_(None))
+        ))
+        session = session.scalar_one_or_none()
+        if session:
+            session.ended_at = datetime.datetime.utcnow()
+    await db.execute(delete(User).where(User.id == user_id))
+    await db.execute(delete(ChatSession).where(
+        (ChatSession.encrypted_user1 == encrypt_id(user_id)) | (ChatSession.encrypted_user2 == encrypt_id(user_id))
+    ))
+    await db.commit()
+
+waiting_users = {}
+
+async def try_match(user_id: int, bot: Bot):
+    prefs = waiting_users.get(user_id)
+    if not prefs:
+        return
+    for uid, other_prefs in list(waiting_users.items()):
+        if uid == user_id:
+            continue
+        if other_prefs["room"] == prefs["room"]:
+            target = uid
+            token = generate_session_token()
+            async with AsyncSessionLocal() as db:
+                session = ChatSession(
+                    encrypted_user1=encrypt_id(user_id),
+                    encrypted_user2=encrypt_id(target),
+                    session_token=token
+                )
+                db.add(session)
+                user1 = await get_or_create_user(user_id, db)
+                user2 = await get_or_create_user(target, db)
+                user1.current_partner = target
+                user2.current_partner = user_id
+                await db.commit()
+            waiting_users.pop(user_id, None)
+            waiting_users.pop(target, None)
+            await bot.send_message(user_id, "✅ Собеседник найден! Пишите анонимно.\n🎥 /call для видеозвонка\n🚪 /stop для выхода")
+            await bot.send_message(target, "✅ Собеседник найден! Пишите анонимно.\n🎥 /call для видеозвонка\n🚪 /stop для выхода")
+            return
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+dp.message.middleware(RateLimitMiddleware())
+dp.callback_query.middleware(RateLimitMiddleware())
+
+@dp.message(Command("start"))
+async def start_cmd(msg: types.Message):
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(msg.from_user.id, db)
+        if user.banned_until and user.banned_until > datetime.datetime.utcnow():
+            await msg.answer(f"❌ Вы заблокированы до {user.banned_until.strftime('%Y-%m-%d %H:%M')}")
+            return
+    await msg.answer(
+        "👋 Добро пожаловать в анонимный чат!\n"
+        "🔒 Ваши данные полностью скрыты.\n"
+        "Используйте кнопки для поиска собеседника.",
+        reply_markup=main_keyboard()
+    )
+
+@dp.message(F.text == "🔍 Поиск")
+async def find_chat(msg: types.Message):
+    user_id = msg.from_user.id
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(user_id, db)
+        if user.current_partner:
+            await msg.answer("⚠️ Вы уже в чате. Сначала нажмите 'Выйти'.")
+            return
+        waiting_users[user_id] = {
+            "gender": user.search_gender,
+            "age_max": user.search_age_max,
+            "room": user.room or "default",
+            "premium": user.is_premium and (user.premium_until and user.premium_until > datetime.datetime.utcnow())
+        }
+    await msg.answer("🔍 Ищу собеседника...")
+    asyncio.create_task(try_match(user_id, bot))
+
+@dp.message(F.text == "🚪 Выйти")
+@dp.message(Command("stop"))
+async def stop_chat(msg: types.Message):
+    user_id = msg.from_user.id
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(user_id, db)
+        partner = user.current_partner
+        if partner:
+            user.current_partner = None
+            partner_obj = await db.execute(select(User).where(User.id == partner))
+            partner_obj = partner_obj.scalar_one_or_none()
+            if partner_obj:
+                partner_obj.current_partner = None
+            session = await db.execute(select(ChatSession).where(
+                ((ChatSession.encrypted_user1 == encrypt_id(user_id)) | (ChatSession.encrypted_user2 == encrypt_id(user_id))) &
+                (ChatSession.ended_at.is_(None))
+            ))
+            session = session.scalar_one_or_none()
+            if session:
+                session.ended_at = datetime.datetime.utcnow()
+            await db.commit()
+            await bot.send_message(partner, "🚫 Собеседник покинул чат. Используйте /start для нового поиска.")
+    waiting_users.pop(user_id, None)
+    await msg.answer("Чат завершён.", reply_markup=main_keyboard())
+
+@dp.message(F.text == "🗑️ Удалить мои данные")
+@dp.message(Command("delete_my_data"))
+async def delete_my_data(msg: types.Message):
+    user_id = msg.from_user.id
+    async with AsyncSessionLocal() as db:
+        await clear_user_data(user_id, db)
+    await msg.answer("✅ Все ваши данные удалены.", reply_markup=main_keyboard())
+
+@dp.message(F.text == "⭐ Премиум")
+async def premium_info(msg: types.Message):
+    await msg.answer("🌟 Премиум на 72 часа — 1 ⭐ (скоро).\nПервое место в поиске, без рекламы.")
+
+@dp.message(F.text == "💬 Комнаты")
+async def rooms_menu(msg: types.Message):
+    await msg.answer("Выберите критерии поиска:", reply_markup=search_settings_kb())
+
+@dp.message(F.text == "🎥 Позвонить")
+@dp.message(Command("call"))
+async def voice_call(msg: types.Message):
+    user_id = msg.from_user.id
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(user_id, db)
+        partner = user.current_partner
+        if not partner:
+            await msg.answer("❌ Вы не в чате. Сначала найдите собеседника.")
+            return
+        last_key = f"call_{user_id}"
+        if last_key in rate_cache and time.time() - rate_cache[last_key] < 120:
+            await msg.answer("⏳ Подождите 2 минуты перед новым звонком.")
+            return
+        rate_cache[last_key] = time.time()
+        session = await db.execute(select(ChatSession).where(
+            ((ChatSession.encrypted_user1 == encrypt_id(user_id)) | (ChatSession.encrypted_user2 == encrypt_id(user_id))) &
+            (ChatSession.ended_at.is_(None))
+        ))
+        session = session.scalar_one_or_none()
+        if not session:
+            await msg.answer("❌ Сессия чата не найдена.")
+            return
+        room_name = f"AnonChat_{session.session_token}"
+        jitsi_url = f"https://meet.jit.si/{room_name}"
+        await bot.send_message(user_id, f"🔗 Видеозвонок: {jitsi_url}")
+        await bot.send_message(partner, f"📞 Собеседник приглашает вас на звонок: {jitsi_url}")
+
+@dp.callback_query()
+async def handle_callback(cb: types.CallbackQuery):
+    original = verify_signed_data(cb.data)
+    if not original:
+        await cb.answer("❌ Ошибка", show_alert=True)
+        return
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(cb.from_user.id, db)
+        if "gender" in original:
+            gender = original.split("_")[2] if len(original.split("_")) > 2 else "any"
+            user.search_gender = gender if gender != "any" else None
+            await db.commit()
+            await cb.answer(f"Пол: {gender}", show_alert=False)
+        elif "age" in original:
+            age_param = original.split("_")[2]
+            if age_param == "under25":
+                user.search_age_max = 25
+            elif age_param == "25_35":
+                user.search_age_max = 35
+            else:
+                user.search_age_max = None
+            await db.commit()
+            await cb.answer("Возраст сохранён", show_alert=False)
+        elif original == "search_apply":
+            await db.commit()
+            await cb.answer("Настройки сохранены!", show_alert=False)
+            await cb.message.edit_text("✅ Критерии поиска обновлены.")
+            return
+    await cb.message.edit_text("✅ Настройки обновлены.")
+
+@dp.message()
+async def relay_message(msg: types.Message):
+    user_id = msg.from_user.id
+    async with AsyncSessionLocal() as db:
+        user = await get_or_create_user(user_id, db)
+        partner = user.current_partner
+        if not partner:
+            return
+        if msg.text:
+            safe_text = html.escape(msg.text)
+            await bot.send_message(partner, safe_text)
+        elif msg.photo:
+            await bot.send_photo(partner, msg.photo[-1].file_id, caption=html.escape(msg.caption or ""))
+        elif msg.video:
+            await bot.send_video(partner, msg.video.file_id, caption=html.escape(msg.caption or ""))
+        elif msg.voice:
+            await bot.send_voice(partner, msg.voice.file_id)
+        else:
+            await msg.copy_to(partner)
+
+# Веб-сервер для keep-alive на Render
+async def handle_web(request):
+    return web.Response(text="Бот работает")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', handle_web)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logging.info("Веб-сервер запущен на порту 8080")
+
+async def main():
+    await init_db()
+    asyncio.create_task(start_web_server())
+    logging.info("Бот запущен")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
